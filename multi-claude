@@ -1,0 +1,631 @@
+#!/usr/bin/env bash
+#
+# multi-claude - run several Claude Code accounts side by side.
+#
+# The default installation at ~/.claude is treated as read-only. It is never
+# modified, moved or relinked. Each extra account lives in ~/.claude-<name>
+# and borrows config from the default install through symlinks, so commands,
+# skills, agents, plugins, settings and CLAUDE.md stay in one place.
+#
+# Per account (never shared): .claude.json (auth), history.jsonl, sessions,
+# shell-snapshots, caches, logs.
+#
+# Usage:  multi-claude --claude-wispr
+#         multi-claude list
+#         multi-claude run wispr
+#
+set -euo pipefail
+
+PRIMARY="$HOME/.claude"
+BIN_DIR="$HOME/.local/bin"
+BACKUP_SUFFIX=".pre-multi-claude"
+LAUNCHER_MARKER="# generated-by: multi-claude"
+
+# Config shared with the default install (symlinked into each account dir).
+SHARED_CONFIG=(CLAUDE.md RTK.md settings.json commands skills agents plugins plans ide agent-memory)
+
+# Session state. Shared by default so a session started under one account can
+# be resumed under another. Disable with --no-share-sessions.
+SHARED_SESSION=(projects todos session-env)
+
+DRY_RUN=0
+SHARE_SESSIONS=1
+SHARE_SETTINGS=1
+DO_LOGIN=1
+DO_LOGOUT=1
+LOGIN_ARGS=(--claudeai)
+CLAUDE_BIN=""
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+run() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '       [dry-run] %s\n' "$*"
+  else
+    "$@"
+  fi
+}
+
+resolve_claude() {
+  CLAUDE_BIN="$(command -v claude || true)"
+  [ -n "$CLAUDE_BIN" ] || die "claude not found on PATH"
+}
+
+account_dir() { printf '%s/.claude-%s' "$HOME" "$1"; }
+
+validate_name() {
+  local name="$1"
+  [ -n "$name" ] || die "account name is empty"
+  case "$name" in
+    *[!a-zA-Z0-9._-]*) die "invalid account name '$name' (use letters, digits, . _ -)" ;;
+  esac
+  case "$name" in
+    .*|*/*) die "invalid account name '$name'" ;;
+  esac
+}
+
+guard_primary() {
+  local dir="$1"
+  [ "$dir" != "$PRIMARY" ] || die "refusing to operate on the default install at $PRIMARY"
+  case "$dir" in
+    "$HOME"/.claude-*) : ;;
+    *) die "refusing to operate on $dir (accounts must live at ~/.claude-<name>)" ;;
+  esac
+}
+
+check_primary() {
+  [ -d "$PRIMARY" ] || die "default install not found at $PRIMARY"
+  [ ! -L "$PRIMARY" ] || die "$PRIMARY is a symlink; resolve that before using this script"
+}
+
+# free_backup_path <path> - never reuse an existing backup path, so a second
+# run cannot mv a directory *inside* the backup left by the first one.
+free_backup_path() {
+  local base="$1$BACKUP_SUFFIX" candidate="$1$BACKUP_SUFFIX" n=1
+  while [ -e "$candidate" ] || [ -L "$candidate" ]; do
+    candidate="$base.$n"
+    n=$((n + 1))
+  done
+  printf '%s' "$candidate"
+}
+
+# unshare_item <account-dir> <item> - drop a shared symlink so the account gets
+# its own private copy of that state from here on.
+unshare_item() {
+  local dir="$1" item="$2" dst="$dir/$item"
+  if [ -L "$dst" ]; then
+    case "$(readlink "$dst")" in
+      "$PRIMARY"/*)
+        run rm "$dst"
+        say "  unlink $item (now private, existing shared data stays in $PRIMARY)"
+        return ;;
+    esac
+  fi
+  say "  ok    $item (already private)"
+}
+
+# link_item <account-dir> <item>
+link_item() {
+  local dir="$1" item="$2"
+  local src="$PRIMARY/$item" dst="$dir/$item"
+
+  if [ ! -e "$src" ]; then
+    say "  skip  $item (not present in $PRIMARY, will stay per-account)"
+    return
+  fi
+
+  if [ -L "$dst" ]; then
+    if [ "$(readlink "$dst")" = "$src" ]; then
+      say "  ok    $item"
+      return
+    fi
+    run rm "$dst"
+  elif [ -e "$dst" ]; then
+    local backup; backup="$(free_backup_path "$dst")"
+    run mv "$dst" "$backup"
+    say "  saved $item as ${backup##*/} (real data, not deleted)"
+  fi
+
+  run ln -s "$src" "$dst"
+  say "  link  $item -> $src"
+}
+
+copy_item() {
+  local dir="$1" item="$2"
+  local src="$PRIMARY/$item" dst="$dir/$item"
+  [ -e "$src" ] || { say "  skip  $item (not present in $PRIMARY)"; return; }
+
+  # Decide before mutating anything, otherwise a dry-run stats through the
+  # symlink that a real run would have removed and reports the opposite.
+  if [ -L "$dst" ]; then
+    run rm "$dst"
+  elif [ -e "$dst" ]; then
+    say "  ok    $item (already a private copy, left alone)"
+    return
+  fi
+
+  run cp -a "$src" "$dst"
+  say "  copy  $item (private copy, edits stay in this account)"
+}
+
+apply_links() {
+  local dir="$1" item
+
+  say "Linking shared config from $PRIMARY:"
+  for item in "${SHARED_CONFIG[@]}"; do
+    if [ "$item" = "settings.json" ] && [ "$SHARE_SETTINGS" -eq 0 ]; then
+      copy_item "$dir" "$item"
+    else
+      link_item "$dir" "$item"
+    fi
+  done
+
+  if [ "$SHARE_SESSIONS" -eq 1 ]; then
+    say "Linking shared session state:"
+    for item in "${SHARED_SESSION[@]}"; do
+      link_item "$dir" "$item"
+    done
+  else
+    say "Keeping session state private to this account:"
+    for item in "${SHARED_SESSION[@]}"; do
+      unshare_item "$dir" "$item"
+    done
+  fi
+}
+
+is_our_launcher() {
+  [ -f "$1" ] || return 1
+  grep -qF "$LAUNCHER_MARKER" "$1" 2>/dev/null
+}
+
+write_launcher() {
+  local name="$1" dir="$2"
+  local path="$BIN_DIR/claude-$name"
+
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    if [ ! -f "$path" ] || [ -L "$path" ]; then
+      warn "$path exists and is not a regular file, skipping launcher"
+      return
+    fi
+    if ! is_our_launcher "$path"; then
+      local backup; backup="$(free_backup_path "$path")"
+      run mv "$path" "$backup"
+      say "Saved your existing $path as $backup"
+    fi
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '       [dry-run] write launcher %s\n' "$path"
+    return
+  fi
+
+  mkdir -p "$BIN_DIR"
+  cat > "$path" <<EOF
+#!/usr/bin/env bash
+$LAUNCHER_MARKER
+# Runs Claude Code as the '$name' account.
+export CLAUDE_CONFIG_DIR="$dir"
+exec "$CLAUDE_BIN" "\$@"
+EOF
+  chmod +x "$path"
+  say "Launcher: $path"
+}
+
+# run_claude <account-dir> <args...> - invoke the CLI against one account.
+# The default install is queried with CLAUDE_CONFIG_DIR explicitly unset, so a
+# shell launched from claude-<name> cannot make it report the wrong account.
+run_claude() {
+  local dir="$1"; shift
+  if [ "$dir" = "$PRIMARY" ]; then
+    env -u CLAUDE_CONFIG_DIR "$CLAUDE_BIN" "$@"
+  else
+    env CLAUDE_CONFIG_DIR="$dir" "$CLAUDE_BIN" "$@"
+  fi
+}
+
+auth_json() {
+  run_claude "$1" auth status --json 2>/dev/null || true
+}
+
+json_field() {
+  printf '%s\n' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+logged_in_json() {
+  case "$1" in
+    *'"loggedIn"'*true*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_logged_in() {
+  logged_in_json "$(auth_json "$1")"
+}
+
+# account_label <dir> - "email (max, claude.ai)" or "not logged in"
+account_label() {
+  local json email plan method
+  json="$(auth_json "$1")"
+  if ! logged_in_json "$json"; then
+    printf 'not logged in'
+    return
+  fi
+  email="$(json_field "$json" email)"
+  plan="$(json_field "$json" subscriptionType)"
+  method="$(json_field "$json" authMethod)"
+
+  local detail=""
+  if [ -n "$plan" ] && [ -n "$method" ]; then
+    detail="$plan, $method"
+  else
+    detail="$plan$method"
+  fi
+
+  printf '%s' "${email:-logged in}"
+  if [ -n "$detail" ]; then
+    printf ' (%s)' "$detail"
+  fi
+  return 0
+}
+
+do_login() {
+  local name="$1" dir="$2"
+
+  if is_logged_in "$dir"; then
+    say "Account '$name' is already logged in."
+    return
+  fi
+
+  say ""
+  say "Log in to the subscription you want to use for '$name'."
+  say "This opens the browser OAuth flow against $dir only."
+  printf 'Press Enter to start login (Ctrl-C to skip and log in later): '
+  read -r _ || return 0
+
+  run_claude "$dir" auth login ${LOGIN_ARGS+"${LOGIN_ARGS[@]}"} || true
+
+  local label; label="$(account_label "$dir")"
+  case "$label" in
+    "not logged in")
+      warn "'$name' still reports not logged in. Retry with: multi-claude login $name" ;;
+    *)
+      say "Logged in as $label" ;;
+  esac
+}
+
+summary() {
+  local name="$1" dir="$2"
+  say ""
+  say "Account '$name' ready."
+  say ""
+  say "  Config dir : $dir"
+  say "  Launch     : claude-$name        (or: multi-claude run $name)"
+  say "  Maestro    : set CLAUDE_CONFIG_DIR=$dir on that agent"
+  say "  Default    : $PRIMARY untouched"
+}
+
+cmd_create() {
+  local name="$1"
+  validate_name "$name"
+  local dir; dir="$(account_dir "$name")"
+  guard_primary "$dir"
+  check_primary
+  resolve_claude
+
+  if [ -d "$dir" ]; then
+    say "Account '$name' already exists at $dir, re-applying links."
+  else
+    say "Creating account '$name' at $dir"
+    run mkdir -p "$dir"
+  fi
+  # Always, not just on create: the CLI makes $CLAUDE_CONFIG_DIR mode 755 and
+  # this dir holds that account's credentials.
+  run chmod 700 "$dir"
+
+  apply_links "$dir"
+  write_launcher "$name" "$dir"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    say ""
+    say "Dry run complete. Nothing was written."
+    return
+  fi
+
+  if [ "$DO_LOGIN" -eq 1 ]; then
+    do_login "$name" "$dir"
+  else
+    say "Skipping login (--no-login). Run: multi-claude run $name"
+  fi
+
+  summary "$name" "$dir"
+}
+
+cmd_list() {
+  resolve_claude
+  local found=0 dir name state
+  say "Default install:"
+  state="$(account_label "$PRIMARY")"
+  printf '  %-14s %-30s %s\n' "(default)" "$PRIMARY" "$state"
+  say ""
+  say "Extra accounts:"
+  for dir in "$HOME"/.claude-*; do
+    [ -d "$dir" ] || continue
+    found=1
+    name="${dir##*/.claude-}"
+    state="$(account_label "$dir")"
+    printf '  %-14s %-30s %s\n' "$name" "$dir" "$state"
+  done
+  if [ "$found" -eq 0 ]; then
+    say "  (none yet, create one with: multi-claude --claude-<name>)"
+  fi
+}
+
+cmd_status() {
+  local name="$1"
+  validate_name "$name"
+  local dir; dir="$(account_dir "$name")"
+  [ -d "$dir" ] || die "no account '$name' at $dir"
+  resolve_claude
+
+  say "Account '$name' -> $dir"
+  say "  auth: $(account_label "$dir")"
+  say "  entries:"
+  local entry base target
+  for entry in "$dir"/* "$dir"/.claude.json; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    base="${entry##*/}"
+    if [ -L "$entry" ]; then
+      target="$(readlink "$entry")"
+      if [ -e "$entry" ]; then
+        printf '    shared   %-16s -> %s\n' "$base" "$target"
+      else
+        printf '    BROKEN   %-16s -> %s\n' "$base" "$target"
+      fi
+    else
+      printf '    private  %s\n' "$base"
+    fi
+  done
+}
+
+cmd_remove() {
+  local name="$1"
+  validate_name "$name"
+  local dir; dir="$(account_dir "$name")"
+  guard_primary "$dir"
+  [ -d "$dir" ] || die "no account '$name' at $dir"
+
+  resolve_claude
+  local launcher="$BIN_DIR/claude-$name"
+  local label; label="$(account_label "$dir")"
+
+  say "About to tear down account '$name':"
+  say "  config dir : $dir"
+  say "  auth       : $label"
+  if is_our_launcher "$launcher"; then
+    say "  launcher   : $launcher"
+  elif [ -e "$launcher" ]; then
+    say "  launcher   : $launcher (not ours, will be left alone)"
+  else
+    say "  launcher   : none"
+  fi
+  if [ "$DO_LOGOUT" -eq 1 ]; then
+    say "  session    : will run 'claude auth logout' first"
+  else
+    say "  session    : left signed in (--keep-session)"
+  fi
+  say ""
+  say "Shared targets inside $PRIMARY are not touched. Sessions in"
+  say "$PRIMARY/projects survive, they belong to the shared dir."
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    say ""
+    say "Dry run. Nothing was removed."
+    return
+  fi
+
+  printf "Type the account name to confirm: "
+  local answer; read -r answer || true
+  [ "$answer" = "$name" ] || die "aborted"
+
+  # Sign out before the dir disappears, otherwise the session stays valid
+  # server-side and any keychain entry for it is orphaned.
+  if [ "$DO_LOGOUT" -eq 1 ]; then
+    case "$label" in
+      "not logged in") : ;;
+      *) run_claude "$dir" auth logout || warn "logout failed, sign out from claude.ai settings if needed" ;;
+    esac
+  fi
+
+  # Unlink symlinks first so nothing can be followed into $PRIMARY.
+  local entry base
+  for entry in "$dir"/* "$dir"/.*; do
+    base="${entry##*/}"
+    case "$base" in
+      .|..|'*'|'.*') continue ;;
+    esac
+    if [ -L "$entry" ]; then
+      run rm "$entry"
+    fi
+  done
+  run rm -rf "$dir"
+
+  if [ ! -e "$launcher" ]; then
+    :
+  elif is_our_launcher "$launcher"; then
+    run rm -f "$launcher"
+  else
+    warn "left $launcher alone, it was not generated by multi-claude"
+  fi
+  say "Removed '$name'."
+
+  # Backups are the user's own data, never auto-deleted. Just point at them.
+  local leftovers
+  leftovers="$(find "$BIN_DIR" -maxdepth 1 -name "claude-$name$BACKUP_SUFFIX*" 2>/dev/null || true)"
+  if [ -n "$leftovers" ]; then
+    say ""
+    say "Left in place (your files, delete by hand if you want them gone):"
+    printf '  %s\n' $leftovers
+  fi
+}
+
+cmd_login() {
+  local name="$1"
+  validate_name "$name"
+  local dir; dir="$(account_dir "$name")"
+  guard_primary "$dir"
+  [ -d "$dir" ] || die "no account '$name' at $dir"
+  resolve_claude
+  do_login "$name" "$dir"
+}
+
+cmd_run() {
+  local name="$1"; shift
+  validate_name "$name"
+  local dir; dir="$(account_dir "$name")"
+  [ -d "$dir" ] || die "no account '$name' at $dir"
+  resolve_claude
+  exec env CLAUDE_CONFIG_DIR="$dir" "$CLAUDE_BIN" "$@"
+}
+
+cmd_doctor() {
+  check_primary
+  local problems=0 dir name entry target
+
+  say "Default install $PRIMARY:"
+  for entry in "$PRIMARY"/*; do
+    if [ -L "$entry" ]; then
+      target="$(readlink "$entry")"
+      case "$target" in
+        "$HOME"/.claude-*)
+          say "  PROBLEM ${entry##*/} points into an account dir ($target)"
+          problems=$((problems + 1)) ;;
+      esac
+    fi
+  done
+  if [ "$problems" -eq 0 ]; then
+    say "  clean, nothing points out of it"
+  fi
+
+  for dir in "$HOME"/.claude-*; do
+    [ -d "$dir" ] || continue
+    name="${dir##*/.claude-}"
+    say ""
+    say "Account '$name' ($dir):"
+    for entry in "$dir"/*; do
+      [ -L "$entry" ] || continue
+      target="$(readlink "$entry")"
+      case "$target" in
+        "$PRIMARY"/*) : ;;
+        *) say "  PROBLEM ${entry##*/} points outside $PRIMARY ($target)"
+           problems=$((problems + 1)); continue ;;
+      esac
+      if [ ! -e "$entry" ]; then
+        say "  PROBLEM ${entry##*/} is a broken link -> $target"
+        problems=$((problems + 1))
+      fi
+    done
+    if [ -L "$dir/.claude.json" ]; then
+      say "  PROBLEM .claude.json is a symlink, auth must stay private to this account"
+      problems=$((problems + 1))
+    fi
+  done
+
+  say ""
+  if [ "$problems" -eq 0 ]; then
+    say "No problems found."
+  else
+    say "$problems problem(s) found. Re-run: multi-claude --claude-<name> --no-login"
+    exit 1
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+multi-claude - run several Claude Code accounts side by side
+
+The default install at ~/.claude is never modified. Each extra account lives
+in ~/.claude-<name> and symlinks its config back to the default one.
+
+Commands
+  --claude-<name>            create (or repair) the account ~/.claude-<name>
+                             and prompt for that subscription's login
+  create <name>              same thing, explicit form
+  list                       show every account and its login state
+  status <name>              show what is shared vs private for one account
+  login <name>               log in (or re-log in) an existing account
+  run <name> [args...]       launch Claude Code as that account
+  doctor                     verify links, and that ~/.claude is untouched
+  remove <name>              tear down an account: sign it out, delete its
+                             config dir and the generated launcher
+
+Options (for create and login)
+  --no-login                 set up the dir, skip the login step
+  --no-share-sessions        keep projects/todos/session-env private
+  --no-share-settings        give the account its own copy of settings.json
+  --email <addr>             pre-fill the email on the login page
+  --sso                      force the SSO login flow
+  --console                  log in with Anthropic Console (API billing)
+                             instead of a Claude subscription
+  --keep-session             on remove, skip the sign-out step
+  --dry-run                  print what would happen, write or delete nothing
+
+Shared with ~/.claude
+  CLAUDE.md, RTK.md, settings.json, commands, skills, agents, plugins,
+  plans, ide, agent-memory, plus projects, todos and session-env
+
+Private per account
+  .claude.json (auth), history.jsonl, sessions, shell-snapshots, caches, logs
+
+Examples
+  multi-claude --claude-wispr
+  multi-claude --claude-work --no-share-sessions
+  multi-claude list
+  claude-wispr
+EOF
+}
+
+main() {
+  local cmd="" name="" rest=()
+
+  [ "$#" -gt 0 ] || { usage; exit 0; }
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --claude-*)      cmd="create"; name="${1#--claude-}" ;;
+      create|new)      cmd="create"; name="${2-}"; [ -n "$name" ] || die "create needs a name"; shift ;;
+      list|ls)         cmd="list" ;;
+      status)          cmd="status"; name="${2-}"; [ -n "$name" ] || die "status needs a name"; shift ;;
+      remove|rm)       cmd="remove"; name="${2-}"; [ -n "$name" ] || die "remove needs a name"; shift ;;
+      login)           cmd="login"; name="${2-}"; [ -n "$name" ] || die "login needs a name"; shift ;;
+      run|shell)       cmd="run"; name="${2-}"; [ -n "$name" ] || die "run needs a name"; shift 2; rest=("$@"); break ;;
+      doctor)          cmd="doctor" ;;
+      -h|--help|help)  usage; exit 0 ;;
+      --dry-run)             DRY_RUN=1 ;;
+      --no-login)            DO_LOGIN=0 ;;
+      --keep-session)        DO_LOGOUT=0 ;;
+      --no-share-sessions)   SHARE_SESSIONS=0 ;;
+      --no-share-settings)   SHARE_SETTINGS=0 ;;
+      --sso)                 LOGIN_ARGS+=(--sso) ;;
+      --console)             LOGIN_ARGS=(--console) ;;
+      --email)               [ -n "${2-}" ] || die "--email needs an address"
+                             LOGIN_ARGS+=(--email "$2"); shift ;;
+      *) die "unknown argument '$1' (try: multi-claude --help)" ;;
+    esac
+    shift
+  done
+
+  case "$cmd" in
+    create) cmd_create "$name" ;;
+    login)  cmd_login "$name" ;;
+    list)   cmd_list ;;
+    status) cmd_status "$name" ;;
+    remove) cmd_remove "$name" ;;
+    run)    cmd_run "$name" ${rest+"${rest[@]}"} ;;
+    doctor) cmd_doctor ;;
+    *)      usage; exit 1 ;;
+  esac
+}
+
+main "$@"
