@@ -28,9 +28,20 @@ SHARED_CONFIG=(CLAUDE.md RTK.md settings.json commands skills agents plugins pla
 # be resumed under another. Disable with --no-share-sessions.
 SHARED_SESSION=(projects todos session-env)
 
+# Keys that stay per-account when settings.json is unshared. Everything else
+# in that file is regenerated from the default install by 'sync', so hooks,
+# permissions and the statusline keep living in one place.
+PRIVATE_KEYS=(model effort fastMode alwaysThinkingEnabled outputStyle)
+PRIVATE_MARKER=".multi-claude-private-settings"
+# Copy of what sync last wrote, so drift means "this account changed it",
+# not merely "the default install moved on".
+SETTINGS_BASE=".multi-claude-settings-base.json"
+
 DRY_RUN=0
 SHARE_SESSIONS=1
-SHARE_SETTINGS=1
+SHARE_SETTINGS=auto
+ADOPT=0
+ASSUME_YES=0
 DO_LOGIN=1
 DO_LOGOUT=1
 LOGIN_ARGS=(--claudeai)
@@ -132,22 +143,134 @@ link_item() {
   say "  link  $item -> $src"
 }
 
-copy_item() {
-  local dir="$1" item="$2"
-  local src="$PRIMARY/$item" dst="$dir/$item"
-  [ -e "$src" ] || { say "  skip  $item (not present in $PRIMARY)"; return; }
+private_settings() { [ -e "$1/$PRIVATE_MARKER" ]; }
 
-  # Decide before mutating anything, otherwise a dry-run stats through the
-  # symlink that a real run would have removed and reports the opposite.
-  if [ -L "$dst" ]; then
-    run rm "$dst"
-  elif [ -e "$dst" ]; then
-    say "  ok    $item (already a private copy, left alone)"
+# settings_json <account-dir> <mode>
+# Prints tab-separated records: "keep\t<key>", "drift\t<key>", "adopt\t<text>".
+# mode: plan   - report only, touch nothing
+#       write  - rewrite the account file as primary + its private keys
+#       adopt  - fold the account's extra permission rules back into primary
+settings_json() {
+  python3 - "$PRIMARY/settings.json" "$1/settings.json" "$2" "$1/$SETTINGS_BASE" \
+    "${PRIVATE_KEYS[@]}" <<'PYEOF'
+import json, os, sys, tempfile
+
+primary_path, account_path, mode, base_path = sys.argv[1:5]
+private_keys = sys.argv[5:]
+
+def load(path):
+    if not os.path.exists(path):
+        return {}
+    with open(path) as fh:
+        text = fh.read().strip()
+    return json.loads(text) if text else {}
+
+def store(path, obj):
+    # Write through a temp file in the same dir: an interrupted sync must never
+    # leave a half-written settings.json, and replacing the path (not the
+    # target) is what turns a leftover symlink into a private copy.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".mc-settings-")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(obj, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+try:
+    primary = load(primary_path)
+except ValueError as exc:
+    sys.exit("invalid JSON in %s: %s" % (primary_path, exc))
+try:
+    account = load(account_path)
+except ValueError as exc:
+    sys.exit("invalid JSON in %s: %s" % (account_path, exc))
+
+if mode == "adopt":
+    added = []
+    target = primary.setdefault("permissions", {})
+    source = account.get("permissions", {})
+    for key in ("allow", "deny", "ask", "additionalDirectories"):
+        merged = list(target.get(key, []))
+        seen = set(merged)
+        for item in source.get(key, []):
+            if item not in seen:
+                merged.append(item)
+                seen.add(item)
+                added.append("%s: %s" % (key, item))
+        if merged:
+            target[key] = merged
+    if added:
+        store(primary_path, primary)
+    for line in added:
+        print("adopt\t%s" % line)
+    sys.exit(0)
+
+private = dict((k, account[k]) for k in private_keys if k in account)
+merged = dict(primary)
+merged.update(private)
+
+for key in sorted(private):
+    print("keep\t%s = %s" % (key, json.dumps(private[key])))
+
+# Drift is measured against the last synced copy, not against primary. An
+# account that simply fell behind is not a conflict and must sync silently.
+try:
+    base = load(base_path)
+except ValueError:
+    base = {}
+
+if base and account:
+    for key in sorted(set(account) | set(base)):
+        if key in private_keys:
+            continue
+        if account.get(key) != base.get(key):
+            print("drift\t%s" % key)
+
+if mode == "write":
+    if merged != account:
+        store(account_path, merged)
+    store(base_path, merged)
+PYEOF
+}
+
+# settings_item <account-dir> - honour this account's shared/private choice.
+settings_item() {
+  local dir="$1" dst="$dir/settings.json" want="$SHARE_SETTINGS"
+
+  if [ "$want" = "auto" ]; then
+    if private_settings "$dir"; then want=0; else want=1; fi
+  fi
+
+  if [ "$want" -eq 1 ]; then
+    if private_settings "$dir"; then
+      run rm -f "$dir/$PRIVATE_MARKER"
+      say "  reshare settings.json (private copy about to be replaced by the shared file)"
+    fi
+    link_item "$dir" "settings.json"
     return
   fi
 
-  run cp -a "$src" "$dst"
-  say "  copy  $item (private copy, edits stay in this account)"
+  if [ ! -e "$PRIMARY/settings.json" ]; then
+    say "  skip  settings.json (not present in $PRIMARY)"
+    return
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    say "       [dry-run] make settings.json private, seeded from $PRIMARY"
+    return
+  fi
+
+  [ ! -L "$dst" ] || rm "$dst"
+  settings_json "$dir" write >/dev/null
+  printf '%s\n' "settings.json is private to this account; refresh it with: multi-claude sync ${dir##*/.claude-}" > "$dir/$PRIVATE_MARKER"
+  say "  private settings.json (synced from $PRIMARY, keeps: ${PRIVATE_KEYS[*]})"
 }
 
 apply_links() {
@@ -155,8 +278,8 @@ apply_links() {
 
   say "Linking shared config from $PRIMARY:"
   for item in "${SHARED_CONFIG[@]}"; do
-    if [ "$item" = "settings.json" ] && [ "$SHARE_SETTINGS" -eq 0 ]; then
-      copy_item "$dir" "$item"
+    if [ "$item" = "settings.json" ]; then
+      settings_item "$dir"
     else
       link_item "$dir" "$item"
     fi
@@ -362,6 +485,111 @@ cmd_list() {
   fi
 }
 
+# sync_one <name> <account-dir> - rebuild one account's settings.json from the
+# default install, keeping only PRIVATE_KEYS. Anything else the account had
+# diverging is reported before it is dropped, never silently discarded.
+sync_one() {
+  local name="$1" dir="$2" plan drift keeps
+
+  if [ -L "$dir/settings.json" ]; then
+    say "'$name': settings.json is still shared, nothing to sync."
+    say "  make it private with: multi-claude --claude-$name --no-share-settings --no-login"
+    return
+  fi
+
+  plan="$(settings_json "$dir" plan)" || die "could not read settings for '$name'"
+  keeps="$(printf '%s\n' "$plan" | grep '^keep' | cut -f2- | tr '\n' ';' || true)"
+  drift="$(printf '%s\n' "$plan" | grep -c '^drift' || true)"
+
+  say ""
+  say "Account '$name'  ->  $dir/settings.json"
+  if [ -n "$keeps" ]; then
+    say "  keeping  ${keeps%;}"
+  else
+    say "  keeping  nothing (no per-account keys set yet)"
+  fi
+
+  if [ "$drift" -gt 0 ]; then
+    say "  diverged from the default install in $drift key(s):"
+    printf '%s\n' "$plan" | grep '^drift' | cut -f2- | sed 's/^/    - /'
+
+    local choice="y"
+    if [ "$ADOPT" -eq 1 ]; then
+      choice="a"
+    elif [ "$ASSUME_YES" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+      printf '  [y] overwrite  [a] adopt permission rules into %s first  [n] skip: ' "$PRIMARY/settings.json"
+      read -r choice || choice="n"
+    fi
+
+    case "$choice" in
+      a|A)
+        local adopted
+        adopted="$(settings_json "$dir" adopt)"
+        if [ -n "$adopted" ]; then
+          say "  adopted into the default install:"
+          printf '%s\n' "$adopted" | cut -f2- | sed 's/^/    + /'
+        else
+          say "  nothing to adopt (the divergence is not extra permission rules)"
+        fi ;;
+      y|Y) : ;;
+      *) say "  skipped '$name', settings left as they are"; return ;;
+    esac
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    say "  [dry-run] would rewrite $dir/settings.json"
+    return
+  fi
+
+  if [ "$drift" -gt 0 ]; then
+    local backup; backup="$(free_backup_path "$dir/settings.json")"
+    cp -p "$dir/settings.json" "$backup"
+    say "  saved    ${backup##*/} (the pre-sync copy, yours to delete)"
+  fi
+
+  settings_json "$dir" write >/dev/null
+  say "  synced"
+}
+
+cmd_sync() {
+  local names=() dir name arg
+  # 'sync' swallows the rest of the command line, so accept its own flags here
+  # too: 'multi-claude sync --adopt' reads the way anyone would type it.
+  for arg in "$@"; do
+    case "$arg" in
+      --adopt)   ADOPT=1 ;;
+      --yes|-y)  ASSUME_YES=1 ;;
+      --dry-run) DRY_RUN=1 ;;
+      -*)        die "unknown argument '$arg' (try: multi-claude --help)" ;;
+      *)         names+=("$arg") ;;
+    esac
+  done
+  check_primary
+
+  if [ "${#names[@]}" -eq 0 ]; then
+    for dir in "$HOME"/.claude-*; do
+      [ -d "$dir" ] || continue
+      private_settings "$dir" || continue
+      names+=("${dir##*/.claude-}")
+    done
+    if [ "${#names[@]}" -eq 0 ]; then
+      say "No account has a private settings.json yet."
+      say "Make one private with: multi-claude --claude-<name> --no-share-settings --no-login"
+      return
+    fi
+  fi
+
+  for name in "${names[@]}"; do
+    validate_name "$name"
+    dir="$(account_dir "$name")"
+    guard_primary "$dir"
+    [ -d "$dir" ] || die "no account '$name' at $dir"
+    sync_one "$name" "$dir"
+  done
+  say ""
+  say "Source of truth: $PRIMARY/settings.json"
+}
+
 cmd_status() {
   local name="$1"
   validate_name "$name"
@@ -371,11 +599,20 @@ cmd_status() {
 
   say "Account '$name' -> $dir"
   say "  auth: $(account_label "$dir")"
+  if private_settings "$dir"; then
+    say "  settings: private (keeps ${PRIVATE_KEYS[*]}, rest synced from $PRIMARY)"
+    settings_json "$dir" plan | grep '^keep' | cut -f2- | sed 's/^/    /' || true
+  else
+    say "  settings: shared with $PRIMARY"
+  fi
   say "  entries:"
   local entry base target
   for entry in "$dir"/* "$dir"/.claude.json; do
     [ -e "$entry" ] || [ -L "$entry" ] || continue
     base="${entry##*/}"
+    case "$base" in
+      "$SETTINGS_BASE"|"$PRIVATE_MARKER") continue ;;
+    esac
     if [ -L "$entry" ]; then
       target="$(readlink "$entry")"
       if [ -e "$entry" ]; then
@@ -530,6 +767,20 @@ cmd_doctor() {
       say "  PROBLEM .claude.json is a symlink, auth must stay private to this account"
       problems=$((problems + 1))
     fi
+    if private_settings "$dir"; then
+      if [ -L "$dir/settings.json" ]; then
+        say "  PROBLEM settings.json is marked private but is still a symlink"
+        problems=$((problems + 1))
+      else
+        local drift
+        drift="$(settings_json "$dir" plan | grep -c '^drift' || true)"
+        if [ "$drift" -gt 0 ]; then
+          say "  LOCAL   settings.json edited in this account in $drift key(s); run: multi-claude sync $name"
+        else
+          say "  ok      settings.json private and in sync"
+        fi
+      fi
+    fi
   done
 
   say ""
@@ -556,6 +807,9 @@ Commands
   status <name>              show what is shared vs private for one account
   login <name>               log in (or re-log in) an existing account
   run <name> [args...]       launch Claude Code as that account
+  sync [name...]             rebuild each private settings.json from the
+                             default install, keeping that account's own
+                             model/effort keys (no names = every such account)
   doctor                     verify links, and that ~/.claude is untouched
   remove <name>              tear down an account: sign it out, delete its
                              config dir and the generated launcher
@@ -563,7 +817,12 @@ Commands
 Options (for create and login)
   --no-login                 set up the dir, skip the login step
   --no-share-sessions        keep projects/todos/session-env private
-  --no-share-settings        give the account its own copy of settings.json
+  --no-share-settings        give the account its own settings.json, so /model
+                             is per-account (refresh it later with: sync)
+  --share-settings           undo that and go back to the shared symlink
+  --adopt                    on sync, fold permission rules the account picked
+                             up back into ~/.claude/settings.json first
+  --yes                      on sync, overwrite diverged keys without asking
   --email <addr>             pre-fill the email on the login page
   --sso                      force the SSO login flow
   --console                  log in with Anthropic Console (API billing)
@@ -578,9 +837,18 @@ Shared with ~/.claude
 Private per account
   .claude.json (auth), history.jsonl, sessions, shell-snapshots, caches, logs
 
+Per-account settings
+  With --no-share-settings the account gets a real settings.json instead of the
+  symlink, so /model persists there and does not move the other accounts. Only
+  model, effort, fastMode, alwaysThinkingEnabled and outputStyle stay local;
+  'sync' rewrites everything else from ~/.claude/settings.json, which stays the
+  one place to edit hooks, permissions and the statusline.
+
 Examples
   multi-claude --claude-wispr
   multi-claude --claude-work --no-share-sessions
+  multi-claude --claude-gn --no-share-settings --no-login
+  multi-claude sync
   multi-claude list
   claude-wispr
 EOF
@@ -600,6 +868,7 @@ main() {
       remove|rm)       cmd="remove"; name="${2-}"; [ -n "$name" ] || die "remove needs a name"; shift ;;
       login)           cmd="login"; name="${2-}"; [ -n "$name" ] || die "login needs a name"; shift ;;
       run|shell)       cmd="run"; name="${2-}"; [ -n "$name" ] || die "run needs a name"; shift 2; rest=("$@"); break ;;
+      sync)            cmd="sync"; shift; rest=("$@"); break ;;
       doctor)          cmd="doctor" ;;
       -h|--help|help)  usage; exit 0 ;;
       --dry-run)             DRY_RUN=1 ;;
@@ -607,6 +876,9 @@ main() {
       --keep-session)        DO_LOGOUT=0 ;;
       --no-share-sessions)   SHARE_SESSIONS=0 ;;
       --no-share-settings)   SHARE_SETTINGS=0 ;;
+      --share-settings)      SHARE_SETTINGS=1 ;;
+      --adopt)               ADOPT=1 ;;
+      --yes|-y)              ASSUME_YES=1 ;;
       --sso)                 LOGIN_ARGS+=(--sso) ;;
       --console)             LOGIN_ARGS=(--console) ;;
       --email)               [ -n "${2-}" ] || die "--email needs an address"
@@ -623,6 +895,7 @@ main() {
     status) cmd_status "$name" ;;
     remove) cmd_remove "$name" ;;
     run)    cmd_run "$name" ${rest+"${rest[@]}"} ;;
+    sync)   cmd_sync ${rest+"${rest[@]}"} ;;
     doctor) cmd_doctor ;;
     *)      usage; exit 1 ;;
   esac
